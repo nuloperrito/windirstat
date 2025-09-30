@@ -184,7 +184,7 @@ bool FinderNtfsContext::LoadRoot(CItem* driveitem)
     if (!volumePath.empty() && volumePath[0] != L'\\' && volumePath[0] != L'/') volumePath.insert(0, L"\\\\.\\");
 
     // Open volume handle without FILE_FLAG_OVERLAPPED for synchronous I/O
-    SmartPointer<HANDLE> volumeHandle(CloseHandle,CreateFile(volumePath.c_str(), FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    SmartPointer<HANDLE> volumeHandle(CloseHandle, CreateFile(volumePath.c_str(), FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr));
     if (volumeHandle == INVALID_HANDLE_VALUE) return false;
@@ -215,7 +215,7 @@ bool FinderNtfsContext::LoadRoot(CItem* driveitem)
 
     // Extract data run origins and cluster counts
     RETRIEVAL_POINTERS_BUFFER* retrievalBuffer = ByteOffset<RETRIEVAL_POINTERS_BUFFER>(dataRunsBuffer.data(), 0);
-    std::vector<std::pair<ULONGLONG, ULONGLONG>> dataRuns(retrievalBuffer->ExtentCount, {});
+    std::vector<std::pair<ULONGLONG, ULONGLONG>> dataRuns(retrievalBuffer->ExtentCount);
     for (DWORD i = 0; i < retrievalBuffer->ExtentCount; i++)
     {
         dataRuns[i] = { retrievalBuffer->Extents[i].Lcn.QuadPart,
@@ -236,106 +236,116 @@ bool FinderNtfsContext::LoadRoot(CItem* driveitem)
 
     // Process MFT records
     std::for_each(std::execution::par_unseq, dataRuns.begin(), dataRuns.end(), [&](const auto& dataRun)
-    {
-        constexpr size_t bufferSize = 4ull * 1024 * 1024;
-        std::vector<UCHAR> buffer;
-        buffer.reserve(bufferSize);
-        const auto& [clusterStart, clusterCount] = dataRun;
-
-        // Enumerate over the data run in buffer-sized chunks
-        ULONGLONG bytesToRead = clusterCount * volumeInfo.BytesPerCluster;
-        LARGE_INTEGER fileOffset{ .QuadPart = static_cast<LONGLONG>(clusterStart * volumeInfo.BytesPerCluster) };
-        for (ULONG bytesRead = 0; bytesToRead > 0; bytesToRead -= bytesRead, fileOffset.QuadPart += bytesRead)
         {
-            // Animate pacman
-            driveitem->UpwardDrivePacman();
+            constexpr size_t bufferSize = 4ull * 1024 * 1024;
+            std::vector<UCHAR> buffer;
+            buffer.reserve(bufferSize);
+            const auto& [clusterStart, clusterCount] = dataRun;
 
-            // Set file pointer for synchronous read
-            const ULONG bytesThisRead = static_cast<ULONG>(min(bytesToRead, bufferSize));
-            SmartPointer<HANDLE> event(CloseHandle, CreateEvent(nullptr, TRUE, FALSE, nullptr));
-            OVERLAPPED overlapped = { .Offset = fileOffset.LowPart, .OffsetHigh = static_cast<DWORD>(fileOffset.HighPart), . hEvent = event };
-            if (ReadFile(volumeHandle, buffer.data(), bytesThisRead, &bytesRead, &overlapped) == 0 && GetLastError() != ERROR_IO_PENDING ||
-                WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0 ||
-                GetOverlappedResult(volumeHandle, &overlapped, &bytesRead, TRUE) == 0)
+            // Enumerate over the data run in buffer-sized chunks
+            ULONGLONG bytesToRead = clusterCount * volumeInfo.BytesPerCluster;
+            LARGE_INTEGER fileOffset{ .QuadPart = static_cast<LONGLONG>(clusterStart * volumeInfo.BytesPerCluster) };
+            for (ULONG bytesRead = 0; bytesToRead > 0; bytesToRead -= bytesRead, fileOffset.QuadPart += bytesRead)
             {
-                break;
-            }
+                // Animate pacman
+                driveitem->UpwardDrivePacman();
 
-            for (ULONG offset = 0; offset + volumeInfo.BytesPerFileRecordSegment <= bytesRead; offset += volumeInfo.BytesPerFileRecordSegment)
-            {
-                // Process MFT record inline
-                const auto fileRecord = ByteOffset<FILE_RECORD>(buffer.data(), offset);
-
-                // Apply fixup
-                const auto wordsPerSector = volumeInfo.BytesPerSector / sizeof(USHORT);
-                const auto fixupArray = ByteOffset<USHORT>(fileRecord, fileRecord->UsaOffset);
-                const auto usn = fixupArray[0];
-                const auto recordWords = reinterpret_cast<PUSHORT>(ByteOffset<UCHAR>(buffer.data(), offset));
-                for (ULONG i = 1; i < fileRecord->UsaCount; ++i)
+                // Set file pointer for synchronous read
+                const ULONG bytesThisRead = static_cast<ULONG>(min(bytesToRead, bufferSize));
+                SmartPointer<HANDLE> event(CloseHandle, CreateEvent(nullptr, TRUE, FALSE, nullptr));
+                OVERLAPPED overlapped = { .Offset = fileOffset.LowPart, .OffsetHigh = static_cast<DWORD>(fileOffset.HighPart), . hEvent = event };
+                if (ReadFile(volumeHandle, buffer.data(), bytesThisRead, &bytesRead, &overlapped) == 0 && GetLastError() != ERROR_IO_PENDING ||
+                    WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0 ||
+                    GetOverlappedResult(volumeHandle, &overlapped, &bytesRead, TRUE) == 0)
                 {
-                    const auto sectorEnd = recordWords + i * wordsPerSector - 1;
-                    if (*sectorEnd == usn) *sectorEnd = fixupArray[i];
+                    break;
                 }
 
-                // Only process records with valid headers and are in use
-                if (!fileRecord->IsValid() || !fileRecord->IsInUse()) continue;
-                const auto currentRecord = fileRecord->SegmentNumber();
-                auto baseRecordIndex = fileRecord->BaseFileRecordNumber > 0 ? fileRecord->BaseFileRecordNumber : currentRecord;
-                getMapBinRef(nonBaseToBaseMapTemp, nonBaseToBaseMapMutex, currentRecord, binSize, numBins) = baseRecordIndex;
-
-                for (auto [curAttribute, endAttribute] = ATTRIBUTE_RECORD::bounds(fileRecord, volumeInfo.BytesPerFileRecordSegment); curAttribute <
-                    endAttribute && curAttribute->TypeCode != AttributeEnd; curAttribute = curAttribute->next())
+                for (ULONG offset = 0; offset + volumeInfo.BytesPerFileRecordSegment <= bytesRead; offset += volumeInfo.BytesPerFileRecordSegment)
                 {
-                    if (curAttribute->TypeCode == AttributeStandardInformation)
+                    // Process MFT record inline
+                    const auto fileRecord = ByteOffset<FILE_RECORD>(buffer.data(), offset);
+
+                    // Apply fixup
+                    const auto fixupArray = ByteOffset<USHORT>(fileRecord, fileRecord->UsaOffset);
+                    const auto usn = fixupArray[0];
+                    const auto recordWords = reinterpret_cast<PUSHORT>(ByteOffset<UCHAR>(buffer.data(), offset));
+
+                    // UsaCount must be > 1 for fixup to be possible and to avoid division by zero.
+                    // The MFT record size must also be a multiple of the number of sectors.
+                    if (fileRecord->UsaCount > 1 && (volumeInfo.BytesPerFileRecordSegment % (fileRecord->UsaCount - 1) == 0))
                     {
-                        if (curAttribute->IsNonResident()) continue;
-                        const auto si = ByteOffset<STANDARD_INFORMATION>(curAttribute, curAttribute->Form.Resident.ValueOffset);
-                        auto& baseRecord = getMapBinRef(baseFileRecordMapTemp, baseFileRecordMapMutex, baseRecordIndex, binSize, numBins);
-                        baseRecord.LastModifiedTime = si->LastModificationTime;
-                        baseRecord.Attributes = si->FileAttributes;
-                        if (fileRecord->IsDirectory()) baseRecord.Attributes |= FILE_ATTRIBUTE_DIRECTORY;
-                        if (baseRecord.Attributes == 0) baseRecord.Attributes = FILE_ATTRIBUTE_NORMAL;
-                    }
-                    else if (curAttribute->TypeCode == AttributeFileName)
-                    {
-                        if (curAttribute->IsNonResident()) continue;
-                        const auto fn = ByteOffset<FILE_NAME>(curAttribute, curAttribute->Form.Resident.ValueOffset);
-                        if (fn->IsShortNameRecord()) continue;
-                        auto& parentToChildEntry = getMapBinRef(parentToChildMapTemp, parentToChildMapMutex, fn->ParentDirectory, binSize, numBins);
-                        parentToChildEntry.emplace(std::wstring{ fn->FileName, fn->FileNameLength }, baseRecordIndex);
-                    }
-                    else if (curAttribute->TypeCode == AttributeData)
-                    {
-                        if (curAttribute->NameLength != 0) continue; // only process default data stream
-                        auto& baseRecord = getMapBinRef(baseFileRecordMapTemp, baseFileRecordMapMutex, baseRecordIndex, binSize, numBins);
-                        if (curAttribute->IsNonResident())
+                        // Dynamically and robustly calculate the sector size based on the MFT record's own metadata,
+                        // ignoring the potentially incorrect value from the API.
+                        const auto bytesPerSector = volumeInfo.BytesPerFileRecordSegment / (fileRecord->UsaCount - 1);
+                        const auto wordsPerSector = bytesPerSector / sizeof(USHORT);
+
+                        for (ULONG i = 1; i < fileRecord->UsaCount; ++i)
                         {
-                            if (curAttribute->Form.Nonresident.LowestVcn != 0) continue;
-                            baseRecord.LogicalSize = curAttribute->Form.Nonresident.FileSize;
-                            baseRecord.PhysicalSize = (curAttribute->IsCompressed() || curAttribute->IsSparse()) ?
-                                curAttribute->Form.Nonresident.Compressed : curAttribute->Form.Nonresident.AllocatedLength;
-                        }
-                        else
-                        {
-                            baseRecord.LogicalSize = curAttribute->Form.Resident.ValueLength;
-                            baseRecord.PhysicalSize = (curAttribute->Form.Resident.ValueLength + 7) & ~7;
+                            const auto sectorEnd = recordWords + i * wordsPerSector - 1;
+                            if (*sectorEnd == usn) *sectorEnd = fixupArray[i];
                         }
                     }
-                    else if (curAttribute->TypeCode == AttributeReparsePoint)
+
+                    // Only process records with valid headers and are in use
+                    if (!fileRecord->IsValid() || !fileRecord->IsInUse()) continue;
+                    const auto currentRecord = fileRecord->SegmentNumber();
+                    auto baseRecordIndex = fileRecord->BaseFileRecordNumber > 0 ? fileRecord->BaseFileRecordNumber : currentRecord;
+                    getMapBinRef(nonBaseToBaseMapTemp, nonBaseToBaseMapMutex, currentRecord, binSize, numBins) = baseRecordIndex;
+
+                    for (auto [curAttribute, endAttribute] = ATTRIBUTE_RECORD::bounds(fileRecord, volumeInfo.BytesPerFileRecordSegment); curAttribute <
+                        endAttribute && curAttribute->TypeCode != AttributeEnd; curAttribute = curAttribute->next())
                     {
-                        if (curAttribute->IsNonResident()) continue;
-                        const auto fn = ByteOffset<Finder::REPARSE_DATA_BUFFER>(curAttribute, curAttribute->Form.Resident.ValueOffset);
-                        auto& baseRecord = getMapBinRef(baseFileRecordMapTemp, baseFileRecordMapMutex, baseRecordIndex, binSize, numBins);
-                        baseRecord.ReparsePointTag = fn->ReparseTag;
-                        if (Finder::IsJunction(*fn))
+                        if (curAttribute->TypeCode == AttributeStandardInformation)
                         {
-                            baseRecord.ReparsePointTag = IO_REPARSE_TAG_JUNCTION_POINT;
+                            if (curAttribute->IsNonResident()) continue;
+                            const auto si = ByteOffset<STANDARD_INFORMATION>(curAttribute, curAttribute->Form.Resident.ValueOffset);
+                            auto& baseRecord = getMapBinRef(baseFileRecordMapTemp, baseFileRecordMapMutex, baseRecordIndex, binSize, numBins);
+                            baseRecord.LastModifiedTime = si->LastModificationTime;
+                            baseRecord.Attributes = si->FileAttributes;
+                            if (fileRecord->IsDirectory()) baseRecord.Attributes |= FILE_ATTRIBUTE_DIRECTORY;
+                            if (baseRecord.Attributes == 0) baseRecord.Attributes = FILE_ATTRIBUTE_NORMAL;
+                        }
+                        else if (curAttribute->TypeCode == AttributeFileName)
+                        {
+                            if (curAttribute->IsNonResident()) continue;
+                            const auto fn = ByteOffset<FILE_NAME>(curAttribute, curAttribute->Form.Resident.ValueOffset);
+                            if (fn->IsShortNameRecord()) continue;
+                            auto& parentToChildEntry = getMapBinRef(parentToChildMapTemp, parentToChildMapMutex, fn->ParentDirectory, binSize, numBins);
+                            parentToChildEntry.emplace(std::wstring{ fn->FileName, fn->FileNameLength }, baseRecordIndex);
+                        }
+                        else if (curAttribute->TypeCode == AttributeData)
+                        {
+                            if (curAttribute->NameLength != 0) continue; // only process default data stream
+                            auto& baseRecord = getMapBinRef(baseFileRecordMapTemp, baseFileRecordMapMutex, baseRecordIndex, binSize, numBins);
+                            if (curAttribute->IsNonResident())
+                            {
+                                if (curAttribute->Form.Nonresident.LowestVcn != 0) continue;
+                                baseRecord.LogicalSize = curAttribute->Form.Nonresident.FileSize;
+                                baseRecord.PhysicalSize = (curAttribute->IsCompressed() || curAttribute->IsSparse()) ?
+                                    curAttribute->Form.Nonresident.Compressed : curAttribute->Form.Nonresident.AllocatedLength;
+                            }
+                            else
+                            {
+                                baseRecord.LogicalSize = curAttribute->Form.Resident.ValueLength;
+                                baseRecord.PhysicalSize = (curAttribute->Form.Resident.ValueLength + 7) & ~7;
+                            }
+                        }
+                        else if (curAttribute->TypeCode == AttributeReparsePoint)
+                        {
+                            if (curAttribute->IsNonResident()) continue;
+                            const auto fn = ByteOffset<Finder::REPARSE_DATA_BUFFER>(curAttribute, curAttribute->Form.Resident.ValueOffset);
+                            auto& baseRecord = getMapBinRef(baseFileRecordMapTemp, baseFileRecordMapMutex, baseRecordIndex, binSize, numBins);
+                            baseRecord.ReparsePointTag = fn->ReparseTag;
+                            if (Finder::IsJunction(*fn))
+                            {
+                                baseRecord.ReparsePointTag = IO_REPARSE_TAG_JUNCTION_POINT;
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
 
     {
         // Merge temporary maps into the main maps using jthread for parallel execution
@@ -352,7 +362,7 @@ bool FinderNtfsContext::LoadRoot(CItem* driveitem)
     // Remove bad cluster node
     std::erase_if(m_ParentToChildMap[NtfsNodeRoot], [](const auto& child) {
         return child.BaseRecord < NtfsReservedMax && child.BaseRecord != NtfsNodeRoot;
-    });
+        });
 
     driveitem->SetIndex(NtfsNodeRoot);
     return true;
